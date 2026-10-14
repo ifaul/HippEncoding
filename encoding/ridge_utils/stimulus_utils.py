@@ -6,7 +6,7 @@ from ridge_utils.textgrid import TextGrid
 
 def load_textgrids(stories, data_dir: str):
     """ TODO (shailee): Add description."""
-    base = join(data_dir, "ds003020/derivative/TextGrids")
+    base = join(data_dir, "derivatives/TextGrids")
     grids = {}
     for story in stories:
         grid_path = os.path.join(base, "%s.TextGrid"%story)

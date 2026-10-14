@@ -2,48 +2,101 @@ import numpy as np
 import time
 import pathlib
 import os
+import json
 import h5py
 from multiprocessing.pool import ThreadPool
 from os.path import join, dirname
 
 from ridge_utils.npp import zscore, mcorr
 from ridge_utils.utils import make_delayed
-from config import DATA_DIR
+from config import DATA_DIR, EM_DATA_DIR
 
 def apply_zscore_and_hrf(stories, downsampled_feat, trim, ndelays):
-	"""Get (z-scored and delayed) stimulus for train and test stories.
-	The stimulus matrix is delayed (typically by 2,4,6,8 secs) to estimate the
-	hemodynamic response function with a Finite Impulse Response model.
+    """Get (z-scored and delayed) stimulus for train and test stories.
+    The stimulus matrix is delayed (typically by 2,4,6,8 secs) to estimate the
+    hemodynamic response function with a Finite Impulse Response model.
 
-	Args:
-		stories: List of stimuli stories.
+    Args:
+        stories: List of stimuli stories.
 
-	Variables:
-		downsampled_feat (dict): Downsampled feature vectors for all stories.
-		trim: Trim downsampled stimulus matrix.
-		delays: List of delays for Finite Impulse Response (FIR) model.
+    Variables:
+        downsampled_feat (dict): Downsampled feature vectors for all stories.
+        trim: Trim downsampled stimulus matrix.
+        delays: List of delays for Finite Impulse Response (FIR) model.
 
-	Returns:
-		delstim: <float32>[TRs, features * ndelays]
-	"""
-	stim = [zscore(downsampled_feat[s][5+trim:-trim]) for s in stories]
-	stim = np.vstack(stim)
-	delays = range(1, ndelays+1)
-	delstim = make_delayed(stim, delays)
-	return delstim
+    Returns:
+        delstim: <float32>[TRs, features * ndelays]
+    """
+    stim = [zscore(downsampled_feat[s][5+trim:-trim]) for s in stories]
+    stim = np.vstack(stim)
+    delays = range(1, ndelays+1)
+    delstim = make_delayed(stim, delays)
+    return delstim
 
 def get_response(stories, subject):
-	"""Get the subject"s fMRI response for stories."""
-	main_path = pathlib.Path(__file__).parent.parent.resolve()
-	subject_dir = join(DATA_DIR, "ds003020/derivative/preprocessed_data/%s" % subject)
-	base = os.path.join(main_path, subject_dir)
-	resp = []
-	for story in stories:
-		resp_path = os.path.join(base, "%s.hf5" % story)
-		hf = h5py.File(resp_path, "r")
-		resp.extend(hf["data"][:])
-		hf.close()
-	return np.array(resp)
+    """Get the subject"s fMRI response for stories."""
+    main_path = pathlib.Path(__file__).parent.parent.resolve()
+    subject_dir = join(DATA_DIR, "derivatives/preprocessed_data/%s" % subject)
+    base = os.path.join(main_path, subject_dir)
+    resp = []
+    valid_stories = []
+    for story in stories:
+        resp_path = os.path.join(base, "%s.hf5" % story)
+        if not os.path.exists(resp_path):
+            print(f"WARNING: Response file not found for story '{story}': {resp_path}")
+            continue
+        
+        try:
+            hf = h5py.File(resp_path, "r")
+            resp.extend(hf["data"][:])
+            hf.close()
+            valid_stories.append(story)
+        except (OSError, KeyError) as e:
+            print(f"WARNING: Could not load response for story '{story}': {type(e).__name__}")
+            print(f"  Details: {e}")
+            continue
+    
+    if not resp:
+        raise ValueError(
+            f"No valid response files found for subject {subject} "
+            f"in stories {stories}"
+        )
+    
+    return np.array(resp), valid_stories
+
+def get_story_split(sessions):
+    """
+    Return ordered training and test story lists for the selected sessions.
+    """
+    with open(join(EM_DATA_DIR, "sess_to_story.json"), "r") as f:
+        sess_to_story = json.load(f)
+
+    train_stories = []
+    test_stories = []
+
+    for session in sessions:
+        session = str(session)
+
+        if session not in sess_to_story:
+            raise ValueError(f"Unknown session: {session}")
+
+        stories, test_story = sess_to_story[session]
+
+        train_stories.extend(stories)
+
+        if test_story not in test_stories:
+            test_stories.append(test_story)
+
+    # Remove duplicates while preserving order
+    train_stories = list(dict.fromkeys(train_stories))
+    test_stories = list(dict.fromkeys(test_stories))
+
+    overlap = set(train_stories).intersection(test_stories)
+    if overlap:
+        raise ValueError(f"Training and test stories overlap: {sorted(overlap)}")
+
+    return train_stories, test_stories
+
 
 def get_permuted_corrs(true, pred, blocklen):
 	nblocks = int(true.shape[0] / blocklen)

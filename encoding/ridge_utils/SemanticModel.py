@@ -121,7 +121,9 @@ class SemanticModel(object):
 
         newsm = cls(None, None)
         newsm.data = shf.get_node("/data").read()
-        newsm.vocab = shf.get_node("/vocab").read()
+        raw_vocab = shf.get_node("/vocab").read()
+        # Decode bytes to str, leave other types unchanged
+        newsm.vocab = [v.decode('utf-8') if isinstance(v, (bytes, np.bytes_)) else v for v in raw_vocab]
         shf.close()
         logger.debug("Done loading file..")
         return newsm
