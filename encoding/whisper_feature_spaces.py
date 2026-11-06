@@ -27,13 +27,13 @@ import h5py
 import numpy as np
 import pandas as pd
 
-from config import REPO_DIR
+from config import DATA_DIR
 from ridge_utils.interpdata import lanczosinterp2D
 
 
 WHISPER_FEATURE_DIR = os.environ.get(
     "WHISPER_FEATURE_DIR",
-    os.path.join(REPO_DIR, "derivatives", "features"),
+    os.path.join(DATA_DIR, "derivatives", "features"),
 )
 
 DEFAULT_MODEL = "whisper-large"
@@ -58,8 +58,8 @@ def whisper_paths(story, modelname, feature_dir=None):
         feature_dir = WHISPER_FEATURE_DIR
 
     root = os.path.join(feature_dir, modelname)
-    pkl_path = os.path.join(root, f"narrative-{story}.pkl")
-    h5_path = os.path.join(root, f"narrative-{story}.h5")
+    pkl_path = os.path.join(root, f"{story}.pkl")
+    h5_path = os.path.join(root, f"{story}.h5")
 
     return pkl_path, h5_path
 

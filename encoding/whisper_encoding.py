@@ -4,6 +4,7 @@ import json
 import logging
 import multiprocessing
 from os.path import join
+from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor
 from tqdm import tqdm
 
@@ -16,10 +17,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import KFold
 from threadpoolctl import threadpool_limits
 
-from config import EM_DATA_DIR, REPO_DIR
+from config import DATA_DIR, REPO_DIR
 from encoding_utils import apply_zscore_and_hrf, get_response, get_story_split
 from feature_spaces import _FEATURE_CONFIG, get_feature_space
-from whisper_feature_spaces import get_whisper_feature_space, get_whisper_decoder_feature_space, get_decoder_layer_count
+from whisper_feature_spaces import get_whisper_feature_space
 
 
 def to_numpy(array):
@@ -33,21 +34,18 @@ def to_numpy(array):
     return np.asarray(array)
 
 
-def configure_himalaya_backend(backend="torch_cuda", n_jobs=1, omp_threads=1):
+def configure_himalaya_backend(backend="torch_mps", n_jobs=1, omp_threads=1):
     set_backend(backend)
     if omp_threads < 1:
         raise ValueError("--omp-threads must be at least 1.")
 
     threadpool_limits(limits=omp_threads)
-    if backend == "torch_cuda":
+    if backend == "torch_mps":
         import torch
 
         torch.set_num_threads(omp_threads)
 
     effective_n_jobs = (os.cpu_count() or 1) if n_jobs == -1 else n_jobs
-    print(f"Himalaya backend: {backend}")
-    print(f"Kernelizer jobs: {effective_n_jobs}")
-    print(f"CPU threads per process: {omp_threads}")
     return effective_n_jobs
 
 
@@ -65,13 +63,25 @@ def run_encoding(args):
         raise ValueError("Sessions must satisfy 1 <= session <= 5.")
 
     train_stories, test_stories = get_story_split(args.sessions)
-    all_stories = list(dict.fromkeys(train_stories + test_stories))
+    
+    if args.max_stories is not None and args.max_stories > 0:
+            train_stories = train_stories[: args.max_stories]
 
+    # Get valid stories from fMRI data
+    zRresp, response_train_stories = get_response(train_stories, args.subject)
+    print("Loaded fMRI data for training stories")
+    zPresp, response_test_stories = get_response(test_stories, args.subject)
+    print("Loaded fMRI data for testing stories")
+    valid_train_stories = response_train_stories
+    valid_test_stories = response_test_stories
+    all_stories = list(dict.fromkeys(valid_train_stories + valid_test_stories))
+
+    # Configure language layer and load
     selected_layer = args.layer
 
     if args.feature == "whisper":
         
-        save_location = join(REPO_DIR, "results", args.feature)
+        save_location = join(DATA_DIR, "derivatives", "results", args.modelname)
         layer_selection_path = join(save_location, "layer_selection.json")
         
         if os.path.exists(layer_selection_path):
@@ -91,6 +101,7 @@ def run_encoding(args):
             layer=selected_layer,
             feature_dir=args.feature_dir,
         )
+        print("Loaded feature spaces for all stories")
 
     else:
         if args.feature not in _FEATURE_CONFIG:
@@ -98,20 +109,54 @@ def run_encoding(args):
             raise ValueError(f"Unknown feature '{args.feature}'. Available: {available}")
 
         downsampled_feat = get_feature_space(args.feature, all_stories)
+
+    feature_stories = set(downsampled_feat)
+    valid_train_stories = [
+        story for story in valid_train_stories if story in feature_stories
+    ]
+    valid_test_stories = [
+        story for story in valid_test_stories if story in feature_stories
+    ]
+    if not valid_train_stories or not valid_test_stories:
+        raise ValueError(
+            f"No stories have both response and {args.feature} features "
+            f"for subject {args.subject}."
+        )
+
+    if valid_train_stories != response_train_stories:
+        zRresp, _ = get_response(valid_train_stories, args.subject)
+    if valid_test_stories != response_test_stories:
+        zPresp, _ = get_response(valid_test_stories, args.subject)
     
-    save_location = join(REPO_DIR, "results", args.feature, args.subject)
-    os.makedirs(save_location, exist_ok=True)
+    save_location = join(DATA_DIR, "derivatives", "results", args.modelname, args.subject)
     
     print("Stimulus and response parameters:")
     print(f"trim: {args.trim}, ndelays: {args.ndelays}")
 
-    delRstim = apply_zscore_and_hrf(train_stories, downsampled_feat, args.trim, args.ndelays).astype(np.float32)
-    delPstim = apply_zscore_and_hrf(test_stories, downsampled_feat, args.trim, args.ndelays).astype(np.float32)
+    # Try loading delRstim and delPstim from saved files
+    delRstim_path = Path(DATA_DIR, "derivatives", "features", args.modelname, f"delRstim_{args.max_stories}.npz")
+    delPstim_path = Path(DATA_DIR, "derivatives", "features", args.modelname, "delPstim.npz")
+
+    if delRstim_path.is_file(): 
+        print("Loading saved delRstim")
+        with np.load(delRstim_path) as f:
+            delRstim = f["data"]     
+    else:
+        print("Applying z-scoring and hrf to training stimulus")
+        delRstim = apply_zscore_and_hrf(valid_train_stories, downsampled_feat, args.trim, args.ndelays).astype(np.float32)
+        np.savez(delRstim_path, data=delRstim)
+
+    if delPstim_path.is_file(): 
+        print("Loading saved delPstim")
+        with np.load(delPstim_path) as f:
+            delPstim = f["data"]
+    else:
+        print("Applying z-scoring and hrf to testing stimulus")
+        delPstim = apply_zscore_and_hrf(valid_test_stories, downsampled_feat, args.trim, args.ndelays).astype(np.float32)
+        np.savez(delPstim_path, data=delPstim)
+    
     print("delRstim shape:", delRstim.shape)
     print("delPstim shape:", delPstim.shape)
-
-    zRresp, valid_train_stories = get_response(train_stories, args.subject)
-    zPresp, valid_test_stories = get_response(test_stories, args.subject)
 
     # Filter by non-nan rows
     train_valid = np.isfinite(zRresp).all(axis=0)
@@ -124,22 +169,21 @@ def run_encoding(args):
     print("zRresp_masked shape:", zRresp_masked.shape)
     print("zPresp_masked shape:", zPresp_masked.shape)
 
-    train_stories = valid_train_stories
-    test_stories = valid_test_stories
-
-    if delRstim.shape[0] != zRresp.shape[0]:
+    if delRstim.shape[0] != zRresp_masked.shape[0]:
         raise ValueError(f"Training mismatch: {delRstim.shape[0]} vs {zRresp.shape[0]}")
 
-    if delPstim.shape[0] != zPresp.shape[0]:
+    if delPstim.shape[0] != zPresp_masked.shape[0]:
         raise ValueError(f"Test mismatch: {delPstim.shape[0]} vs {zPresp.shape[0]}")
 
     # =========================================================================
     # Construct Explicit Feature Indices Across HRF Delays
     # =========================================================================
-    total_undelayed_features = downsampled_feat[train_stories[0]].shape[1]
+    total_undelayed_features = downsampled_feat[valid_train_stories[0]].shape[1]
     
-    if args.feature == "whisper":
+    if args.modelname == "whisper-large":
         n_acoustic = n_speech = n_language = 1280
+    elif args.modelname == "whisper-medium":
+        n_acoustic = n_speech = n_language = 1024
     else:
         n_acoustic = n_speech = n_language = total_undelayed_features // 3
 
@@ -170,233 +214,241 @@ def run_encoding(args):
     for name, idxs in feature_slices.items():
         print(f"  {name}: {len(idxs)} features")
 
-    alphas = np.logspace(0, 3, 10)
+    #alphas = np.logspace(1, 30, 30, dtype=np.float32)
+    #diagonalize_method = (args.diagonalize_method)
+    n_alphas_batch = getattr(args, "n_alphas_batch", 1)
+    n_iter = getattr(args, "n_iter", 30)
+    #print(f"Kernel diagonalization method: {diagonalize_method}")
 
     # =========================================================================
     # 1. Joint Banded Ridge Model (acoustic + speech + language)
     # =========================================================================
-    print("\nFitting joint Banded Ridge model (acoustic + speech + language)...")
-    
-    joint_save_location = os.path.join(save_location, "..", "joint", args.subject)
-    os.makedirs(joint_save_location, exist_ok=True)
-    
-    # 3 separate kernels allow MultipleKernelRidgeCV to optimize alphas per feature space
-    joint_kernelizer = ColumnKernelizer(
-        [
-            ("acoustic", Kernelizer(kernel="linear"), acoustic_indices),
-            ("speech", Kernelizer(kernel="linear"), speech_indices),
-            ("language", Kernelizer(kernel="linear"), language_indices),
-        ],
-        n_jobs=effective_n_jobs,
-    )
-    
-    joint_params = dict(
-        alphas=alphas,
-        progress_bar=True,
-        n_iter=100,
-        diagonalize_method="eigh",
-        return_alphas=True,
-    )
-    
-    joint_model = make_pipeline(
-        StandardScaler(with_mean=True, with_std=False),
-        joint_kernelizer,
-        MultipleKernelRidgeCV(kernels="precomputed", solver_params=joint_params),
-    )
-    
-    joint_model.fit(delRstim, zRresp_masked)
-    joint_pred_backend = joint_model.predict(delPstim)
-    joint_corrs = to_numpy(correlation_score_split(zPresp_masked, joint_pred_backend))
-    joint_pred = to_numpy(joint_pred_backend)
-    
-    print(f"Joint model mean correlation: {np.nanmean(joint_corrs):.6f}")
-    
-    joint_ridge = joint_model[-1]
+    if args.featurespace != "individual":
+        print("\nFitting joint Banded Ridge model (acoustic + speech + language)...")
+        
+        joint_save_location = os.path.join(save_location, "..", "joint", args.subject)
+        os.makedirs(joint_save_location, exist_ok=True)
+        
+        # 3 separate kernels allow MultipleKernelRidgeCV to optimize alphas per feature space
+        joint_kernelizer = ColumnKernelizer(
+            [
+                ("acoustic", Kernelizer(kernel="linear"), acoustic_indices),
+                ("speech", Kernelizer(kernel="linear"), speech_indices),
+                ("language", Kernelizer(kernel="linear"), language_indices),
+            ],
+            n_jobs=effective_n_jobs,
+        )
+        
+        joint_params = dict(
+            #alphas=alphas,
+            progress_bar=True,
+            max_iter=n_iter,
+            tol=1e-3,
+            #diagonalize_method=diagonalize_method,
+            n_targets_batch=args.n_targets_batch,
+        )
+        
+        joint_model = make_pipeline(
+            StandardScaler(with_mean=True, with_std=False),
+            joint_kernelizer,
+            MultipleKernelRidgeCV(kernels="precomputed", solver="hyper_gradient", solver_params=joint_params),
+        )
+        
+        joint_model.fit(delRstim, zRresp_masked)
+        joint_pred_backend = joint_model.predict(delPstim)
+        joint_corrs = to_numpy(correlation_score_split(zPresp_masked, joint_pred_backend))
+        joint_pred = to_numpy(joint_pred_backend)
+        
+        print(f"Joint model mean correlation: {np.nanmean(joint_corrs):.6f}")
+        
+        joint_ridge = joint_model[-1]
 
-    # Extract primal weights using StandardScaler-transformed features
-    delRstim_scaled = to_numpy(joint_model[0].transform(delRstim))
+        # Extract primal weights using StandardScaler-transformed features
+        delRstim_scaled = to_numpy(joint_model[0].transform(delRstim))
 
-    try:
-        X_joint_list = [
-            delRstim_scaled[:, acoustic_indices],
-            delRstim_scaled[:, speech_indices],
-            delRstim_scaled[:, language_indices],
-        ]
-        joint_weights = to_numpy(joint_ridge.get_primal_coef(X_joint_list))
-    except Exception as e:
-        print(f"Note: Storing dual coefficients for joint model ({e}).")
-        dual_coef = getattr(joint_ridge, "dual_coef_", None)
-        joint_weights = to_numpy(dual_coef) if dual_coef is not None else None
+        try:
+            X_joint_list = [
+                delRstim_scaled[:, acoustic_indices],
+                delRstim_scaled[:, speech_indices],
+                delRstim_scaled[:, language_indices],
+            ]
+            joint_weights = to_numpy(joint_ridge.get_primal_coef(X_joint_list))
+        except Exception as e:
+            print(f"Note: Storing dual coefficients for joint model ({e}).")
+            dual_coef = getattr(joint_ridge, "dual_coef_", None)
+            joint_weights = to_numpy(dual_coef) if dual_coef is not None else None
 
-    # Reconstruct full-length arrays matching original voxel dimensions
-    total_voxels = zRresp.shape[1]
+        # Reconstruct full-length arrays matching original voxel dimensions
+        total_voxels = zRresp.shape[1]
 
-    # Full Correlation Vector (Total_Voxels,)
-    full_corrs = np.full(total_voxels, np.nan, dtype=np.float32)
-    full_corrs[valid_voxel_mask] = joint_corrs
+        # Full Correlation Vector (Total_Voxels,)
+        full_corrs = np.full(total_voxels, np.nan, dtype=np.float32)
+        full_corrs[valid_voxel_mask] = joint_corrs
 
-    # Full Predictions Matrix (Test_TRs, Total_Voxels)
-    full_pred = np.full_like(zPresp, np.nan, dtype=np.float32)
-    full_pred[:, valid_voxel_mask] = joint_pred
+        # Full Predictions Matrix (Test_TRs, Total_Voxels)
+        full_pred = np.full_like(zPresp, np.nan, dtype=np.float32)
+        full_pred[:, valid_voxel_mask] = joint_pred
 
-    # Full Weights Matrix (Features, Total_Voxels)
-    if joint_weights is not None:
-        n_features = joint_weights.shape[0]
-        full_weights = np.full((n_features, total_voxels), np.nan, dtype=np.float32)
-        full_weights[:, valid_voxel_mask] = joint_weights
-    else:
-        full_weights = None
+        # Full Weights Matrix (Features, Total_Voxels)
+        if joint_weights is not None:
+            n_features = joint_weights.shape[0]
+            full_weights = np.full((n_features, total_voxels), np.nan, dtype=np.float32)
+            full_weights[:, :, valid_voxel_mask] = joint_weights
+        else:
+            full_weights = None
 
-    # Save full-dimensional arrays to disk
-    np.savez(os.path.join(joint_save_location, "corrs.npz"), corrs=full_corrs)
-    np.savez(os.path.join(joint_save_location, "predictions.npz"), predictions=full_pred)
+        # Save full-dimensional arrays to disk
+        np.savez(os.path.join(joint_save_location, "corrs.npz"), corrs=full_corrs)
+        np.savez(os.path.join(joint_save_location, "predictions.npz"), predictions=full_pred)
 
-    if full_weights is not None:
-        np.savez(os.path.join(joint_save_location, "weights.npz"), weights=full_weights)
+        if full_weights is not None:
+            np.savez(os.path.join(joint_save_location, "weights.npz"), weights=full_weights)
 
-    if hasattr(joint_ridge, "best_alphas_"):
-        np.savez(os.path.join(joint_save_location, "alphas.npz"), alphas=joint_ridge.best_alphas_)
-    
-    metadata_joint = {
-        "subject": args.subject,
-        "feature": args.feature,
-        "modelname": args.modelname,
-        "layer": selected_layer if args.feature == "whisper" else None,
-        "sessions": args.sessions,
-        "train_stories": train_stories,
-        "test_stories": test_stories,
-        "model_type": "joint",
-        "feature_spaces": ["acoustic", "speech", "language"],
-        "mean_correlation": float(np.nanmean(joint_corrs)),
-    }
-    
-    with open(os.path.join(joint_save_location, "metadata.json"), "w") as f:
-        json.dump(metadata_joint, f, indent=2)
+        if hasattr(joint_ridge, "best_alphas_"):
+            np.savez(
+                os.path.join(joint_save_location, "alphas.npz"),
+                alphas=to_numpy(joint_ridge.best_alphas_),
+            )
+        
+        metadata_joint = {
+            "subject": args.subject,
+            "feature": args.feature,
+            "modelname": args.modelname,
+            "layer": selected_layer if args.feature == "whisper" else None,
+            "sessions": args.sessions,
+            "train_stories": valid_train_stories,
+            "test_stories": valid_test_stories,
+            "model_type": "joint",
+            "feature_spaces": ["acoustic", "speech", "language"],
+            "mean_correlation": float(np.nanmean(joint_corrs)),
+        }
+        
+        with open(os.path.join(joint_save_location, "metadata.json"), "w") as f:
+            json.dump(metadata_joint, f, indent=2)
 
     # =========================================================================
     # 2. Individual Feature Space Models
     # =========================================================================
-    individual_results = {}
-    
-    for space_name, space_indices in tqdm(
-        feature_slices.items(),
-        desc="Fitting individual feature space models",
-        unit="space",
-    ):
-        print(f"\nFitting {space_name} individual model...")
+    if args.featurespace != "joint":
+        individual_results = {}
         
-        individual_save_location = os.path.join(save_location, "..", space_name, args.subject)
-        os.makedirs(individual_save_location, exist_ok=True)
-        
-        space_kernelizer = ColumnKernelizer(
-            [(space_name, Kernelizer(kernel="linear"), space_indices)],
-            n_jobs=effective_n_jobs,
-        )
-        
-        space_params = dict(
-            alphas=alphas,
-            progress_bar=True,
-            n_iter=100,
-            diagonalize_method="eigh",
-            return_alphas=True,
-        )
-        
-        space_model = make_pipeline(
-            StandardScaler(with_mean=True, with_std=False),
-            space_kernelizer,
-            KernelRidgeCV(kernels="precomputed", solver_params=space_params),
-        )
-        
-        # 1. Fit & Predict using MASKED responses
-        space_model.fit(delRstim, zRresp_masked)
-        space_pred_backend = space_model.predict(delPstim)
-        space_corrs_masked = to_numpy(
-            correlation_score_split(zPresp_masked, space_pred_backend)
-        )
-        space_pred_masked = to_numpy(space_pred_backend)
-        
-        print(f"{space_name} model mean correlation: {np.nanmean(space_corrs_masked):.6f}")
-        
-        space_ridge = space_model[-1]
-        
-        # 2. Extract primal weights using StandardScaler-transformed features
-        delRstim_scaled = to_numpy(space_model[0].transform(delRstim))
-        space_feature_slice_scaled = delRstim_scaled[:, space_indices]
-
-        try:
-            space_weights = to_numpy(
-                space_ridge.get_primal_coef([space_feature_slice_scaled])
+        for space_name, space_indices in tqdm(
+            feature_slices.items(),
+            desc="Fitting individual feature space models",
+            unit="space",
+        ):
+            print(f"\nFitting {space_name} individual model...")
+            
+            individual_save_location = os.path.join(save_location, "..", space_name, args.subject)
+            os.makedirs(individual_save_location, exist_ok=True)
+            
+            space_params = dict(
+                diagonalize_method=diagonalize_method,
+                n_targets_batch=args.n_targets_batch,
+                n_alphas_batch=n_alphas_batch,
             )
-        except Exception:
+
+            train_features = delRstim[:, space_indices]
+            test_features = delPstim[:, space_indices]
+
+            space_model = make_pipeline(
+                StandardScaler(with_mean=True, with_std=False),
+                Kernelizer(kernel="linear"),
+                KernelRidgeCV(
+                    alphas=alphas,
+                    kernel="precomputed",
+                    solver_params=space_params,
+                ),
+            )
+            
+            # 1. Fit & Predict using MASKED responses
+            space_model.fit(train_features, zRresp_masked)
+            space_pred_backend = space_model.predict(test_features)
+            space_corrs_masked = to_numpy(
+                correlation_score_split(zPresp_masked, space_pred_backend)
+            )
+            space_pred_masked = to_numpy(space_pred_backend)
+            
+            print(f"{space_name} model mean correlation: {np.nanmean(space_corrs_masked):.6f}")
+            
+            space_ridge = space_model[-1]
+            
+            # 2. Extract primal weights using StandardScaler-transformed features
+            delRstim_scaled = to_numpy(space_model[0].transform(train_features))
+
             try:
+                # Pass 2D feature matrix directly (n_samples, n_features)
                 space_weights = to_numpy(
-                    space_ridge.get_primal_coef(space_feature_slice_scaled)
+                    space_ridge.get_primal_coef(delRstim_scaled)
                 )
             except Exception as e:
                 print(f"Note: Storing dual coefficients for {space_name} ({e}).")
                 dual_coef = getattr(space_ridge, "dual_coef_", None)
                 space_weights = to_numpy(dual_coef) if dual_coef is not None else None
 
-        # 3. Reconstruct full-length arrays matching original voxel dimensions
-        total_voxels = zRresp.shape[1]
+            # 3. Reconstruct full-length arrays matching original voxel dimensions
+            total_voxels = zRresp.shape[1]
 
-        # Full Correlation Vector (Total_Voxels,)
-        full_corrs = np.full(total_voxels, np.nan, dtype=np.float32)
-        full_corrs[valid_voxel_mask] = space_corrs_masked
+            # Full Correlation Vector (Total_Voxels,)
+            full_corrs = np.full(total_voxels, np.nan, dtype=np.float32)
+            full_corrs[valid_voxel_mask] = space_corrs_masked
 
-        # Full Predictions Matrix (Test_TRs, Total_Voxels)
-        full_pred = np.full_like(zPresp, np.nan, dtype=np.float32)
-        full_pred[:, valid_voxel_mask] = space_pred_masked
+            # Full Predictions Matrix (Test_TRs, Total_Voxels)
+            full_pred = np.full_like(zPresp, np.nan, dtype=np.float32)
+            full_pred[:, valid_voxel_mask] = space_pred_masked
 
-        # Full Weights Matrix (Space_Features, Total_Voxels)
-        if space_weights is not None:
-            n_features_space = space_weights.shape[0]
-            full_weights = np.full((n_features_space, total_voxels), np.nan, dtype=np.float32)
-            full_weights[:, valid_voxel_mask] = space_weights
-        else:
-            full_weights = None
+            # Full Weights Matrix (Space_Features, Total_Voxels)
+            if space_weights is not None:
+                n_features_space = space_weights.shape[0]
+                full_weights = np.full((n_features_space, total_voxels), np.nan, dtype=np.float32)
+                full_weights[:, valid_voxel_mask] = space_weights
+            else:
+                full_weights = None
 
-        # Save full-dimensional arrays to disk
-        np.savez(os.path.join(individual_save_location, "corrs.npz"), corrs=full_corrs)
-        np.savez(os.path.join(individual_save_location, "predictions.npz"), predictions=full_pred)
+            # Save full-dimensional arrays to disk
+            np.savez(os.path.join(individual_save_location, "corrs.npz"), corrs=full_corrs)
+            np.savez(os.path.join(individual_save_location, "predictions.npz"), predictions=full_pred)
 
-        if full_weights is not None:
-            np.savez(os.path.join(individual_save_location, "weights.npz"), weights=full_weights)
+            if full_weights is not None:
+                np.savez(os.path.join(individual_save_location, "weights.npz"), weights=full_weights)
 
-        if hasattr(space_ridge, "best_alphas_"):
-            np.savez(os.path.join(individual_save_location, "alphas.npz"), alphas=space_ridge.best_alphas_)
+            if hasattr(space_ridge, "best_alphas_"):
+                np.savez(
+                    os.path.join(individual_save_location, "alphas.npz"),
+                    alphas=to_numpy(space_ridge.best_alphas_),
+                )
 
-        metadata_individual = {
-            "subject": args.subject,
-            "feature": args.feature,
-            "modelname": args.modelname,
-            "layer": int(selected_layer) if args.feature == "whisper" else None,
-            "sessions": args.sessions,
-            "train_stories": train_stories,
-            "test_stories": test_stories,
-            "model_type": space_name,
-            "mean_correlation": float(np.nanmean(space_corrs_masked)),
-            "weights_saved": full_weights is not None,
-        }
+            metadata_individual = {
+                "subject": args.subject,
+                "feature": args.feature,
+                "modelname": args.modelname,
+                "layer": int(selected_layer) if args.feature == "whisper" else None,
+                "sessions": args.sessions,
+                "train_stories": valid_train_stories,
+                "test_stories": valid_test_stories,
+                "model_type": space_name,
+                "mean_correlation": float(np.nanmean(space_corrs_masked)),
+                "weights_saved": full_weights is not None,
+            }
 
-        with open(os.path.join(individual_save_location, "metadata.json"), "w") as f:
-            json.dump(metadata_individual, f, indent=2)
+            with open(os.path.join(individual_save_location, "metadata.json"), "w") as f:
+                json.dump(metadata_individual, f, indent=2)
 
-        individual_results[space_name] = {
-            "corrs": full_corrs,
-            "predictions": full_pred,
-            "weights": full_weights,
-        }
+            individual_results[space_name] = {
+                "corrs": full_corrs,
+                "predictions": full_pred,
+                "weights": full_weights,
+            }
 
-    # Summary Output
-    print("\n" + "=" * 80)
-    print("MODEL COMPARISON SUMMARY")
-    print("=" * 80)
-    print(f"Joint model (all features): {np.nanmean(joint_corrs):.6f}")
-    for space_name, results in individual_results.items():
-        print(f"{space_name.capitalize():12s} model:        {np.nanmean(results['corrs']):.6f}")
-    print("=" * 80)
-
+    if args.featurespace == "both":
+        # Summary Output
+        print("\n" + "=" * 80)
+        print("MODEL COMPARISON SUMMARY")
+        print("=" * 80)
+        print(f"Joint model (all features): {np.nanmean(joint_corrs):.6f}")
+        for space_name, results in individual_results.items():
+            print(f"{space_name.capitalize():12s} model:        {np.nanmean(results['corrs']):.6f}")
+        print("=" * 80)
 
 def _run_subject(args, subject):
     subject_args = argparse.Namespace(**vars(args))
@@ -455,12 +507,19 @@ if __name__ == "__main__":
     )
     parser.add_argument("--modelname", type=str, default="whisper-large")
     parser.add_argument("--feature-dir", type=str, default=None)
+    parser.add_argument("--featurespace", type=str, default="both", choices=["joint","individual","both"])
     parser.add_argument(
         "--layer",
         type=int,
         default=None,
         help="Manually selected Whisper decoder layer.",
     )
+    parser.add_argument(
+                "--max-stories",
+                type=int,
+                default=None,
+                help="Cap maximum training stories used during layer selection for speed",
+            )
 
     # Feature preprocessing
     parser.add_argument("--trim", type=int, default=5)
@@ -476,8 +535,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--backend",
         type=str,
-        default="torch_cuda",
-        choices=["numpy", "cupy", "torch_cuda"],
+        default="torch_mps",
+        choices=["numpy", "cupy", "torch_cuda", "torch_mps"],
         help="Himalaya backend. Defaults to PyTorch CUDA for GPU runtimes.",
     )
     parser.add_argument(
@@ -493,6 +552,38 @@ if __name__ == "__main__":
         help="CPU thread limit per process (also applies to PyTorch intra-op threads).",
     )
     parser.add_argument(
+        "--n-targets-batch",
+        type=int,
+        default=5000,
+        help=(
+            "Voxel/target batch size for Himalaya CV solvers. Smaller values "
+            "reduce accelerator memory use"
+        ),
+    )
+    parser.add_argument(
+        "--n-alphas-batch",
+        type=int,
+        default=1,
+        help=(
+            "Number of regularization values to process at once. Smaller values "
+            "reduce temporary memory use."
+        ),
+    )
+    parser.add_argument(
+        "--n-iter",
+        type=int,
+        default=30,
+        help="Number of random kernel-weight candidates in joint-model CV.",
+    )
+    parser.add_argument(
+        "--diagonalize-method",
+        choices=["eigh", "svd"],
+        default="svd",
+        help=(
+            "Kernel decomposition for symmetric Gram matrices; eigh is preferred."
+        ),
+    )
+    parser.add_argument(
         "--subject-jobs",
         type=int,
         default=1,
@@ -505,4 +596,10 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     args = parser.parse_args()
+    if args.n_targets_batch < 1:
+        parser.error("--n-targets-batch must be at least 1.")
+    if args.n_alphas_batch < 1:
+        parser.error("--n-alphas-batch must be at least 1.")
+    if args.n_iter < 1:
+        parser.error("--n-iter must be at least 1.")
     run_subjects(args)

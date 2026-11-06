@@ -10,6 +10,7 @@ from os.path import join, dirname
 from ridge_utils.npp import zscore, mcorr
 from ridge_utils.utils import make_delayed
 from config import DATA_DIR, EM_DATA_DIR
+from significance_testing import fdr_correct
 
 def apply_zscore_and_hrf(stories, downsampled_feat, trim, ndelays):
     """Get (z-scored and delayed) stimulus for train and test stories.
@@ -124,7 +125,7 @@ def permutation_test(true, pred, blocklen, nperms):
 	pvals = (real_rsqs <= perm_rsqs).mean(0)
 	return np.array(pvals), perm_rsqs, real_rsqs
 
-def run_permutation_test(zPresp, pred, blocklen, nperms, mode='', thres=0.001):
+def run_permutation_test(zPresp, pred, blocklen, nperms, save_location, thres=0.05):
 	assert zPresp.shape == pred.shape, print(zPresp.shape, pred.shape)
 
 	start_time = time.time()
@@ -146,12 +147,12 @@ def run_permutation_test(zPresp, pred, blocklen, nperms, mode='', thres=0.001):
 	assert perm_rsqs.shape[1] == nvox, (perm_rsqs.shape[1], nvox)
 	assert real_rsqs.shape[0] == nvox, (real_rsqs.shape[0], nvox)
 
-	cci.upload_raw_array(os.path.join(save_location, '%spvals'%mode), pvals)
-	cci.upload_raw_array(os.path.join(save_location, '%sperm_rsqs'%mode), perm_rsqs)
-	cci.upload_raw_array(os.path.join(save_location, '%sreal_rsqs'%mode), real_rsqs)
+	np.save(os.path.join(save_location, "pvals.npy"), pvals)
+	np.save(os.path.join(save_location, "perm_rsqs.npy"), perm_rsqs)
+	np.save(os.path.join(save_location, "real_rsqs.npy"), real_rsqs)
 	print((time.time() - start_time)/60)
 	
 	pID, pN = fdr_correct(pvals, thres)
-	cci.upload_raw_array(os.path.join(save_location, '%sgood_voxels'%mode), (pvals <= pN))
-	cci.upload_raw_array(os.path.join(save_location, '%spN_thres'%mode), np.array([pN, thres], dtype=np.float32))
+	np.save(os.path.join(save_location, "good_voxels.npy"), (pvals <= pN))
+	np.save(os.path.join(save_location, "pN_thres.npy"), np.array([pN, thres], dtype=np.float32))
 	return

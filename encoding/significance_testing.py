@@ -197,7 +197,7 @@ def fdr_correct(pval, thres):
    # remove NaNs
    p = pval[np.nonzero(np.isnan(pval)==False)[0]]
    p = np.sort(p)
-   V = np.float(len(p))
+   V = float(len(p))
    I = np.arange(V) + 1
 
    cVID = 1

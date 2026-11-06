@@ -1,0 +1,18 @@
+{
+"version": "0.2.0",
+"configurations": [
+{
+"name": "Debug encoding.py (cwd=encoding)",
+"type": "python",
+"request": "launch",
+"program": "${workspaceFolder}/deep-fMRI-dataset/encoding/encoding.py",
+"cwd": "${workspaceFolder}/deep-fMRI-dataset/encoding",
+"console": "integratedTerminal",
+"args": ["--subject","UTS03","--feature","eng1000"],
+"env": {
+"PYTHONPATH": "${workspaceFolder}/deep-fMRI-dataset/encoding",
+"DATA_DIR": "/Volumes/Aiolo/HippEncoding"
+}
+}
+]
+}

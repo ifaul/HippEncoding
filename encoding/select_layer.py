@@ -297,8 +297,8 @@ if __name__ == "__main__":
     parser.add_argument("--use-corr", action="store_true")
     parser.add_argument(
         "--backend",
-        choices=["torch_cuda", "cupy", "numpy"],
-        default="torch_cuda",
+        choices=["torch_cuda", "torch_mps", "cupy", "numpy"],
+        default="torch_mps",
         help="Himalaya backend. Defaults to PyTorch CUDA for GPU runtimes.",
     )
     parser.add_argument(
@@ -313,7 +313,7 @@ if __name__ == "__main__":
         default=None,
         help="Cap maximum training stories used during layer selection for speed",
     )
-    args = parser.parse_args()
+  
     args = parser.parse_args()
 
     train_stories, _ = get_story_split(args.sessions)
