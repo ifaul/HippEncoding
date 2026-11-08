@@ -11,9 +11,9 @@ from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from threadpoolctl import threadpool_limits
 
-from config import DATA_DIR, REPO_DIR
+from config import DATA_DIR
 from encoding_utils import apply_zscore_and_hrf, get_response, get_story_split
-from whisper_feature_spaces import get_whisper_decoder_feature_space
+from feature_spaces import get_decoder_layer_count, get_feature_space
 
 def to_numpy(array):
     """Move backend results to host memory before NumPy operations or saving."""
@@ -26,25 +26,20 @@ def to_numpy(array):
     return np.asarray(array)
 
 
-def configure_himalaya_backend(backend="torch_cuda", cpu_threads=1):
-    if cpu_threads < 1:
-        raise ValueError("--cpu-threads must be at least 1.")
+def configure_himalaya_backend(backend="torch_mps", omp_threads=1):
+    if omp_threads < 1:
+        raise ValueError("--omp-threads must be at least 1.")
 
     set_backend(backend)
-    threadpool_limits(limits=cpu_threads)
+    threadpool_limits(limits=omp_threads)
 
-    if backend == "torch_cuda":
+    if backend == "torch_mps":
         import torch
 
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "The torch_cuda backend was requested, but CUDA is unavailable. "
-                "Use --backend numpy for CPU execution."
-            )
-        torch.set_num_threads(cpu_threads)
+        torch.set_num_threads(omp_threads)
 
     print(f"Himalaya backend: {backend}")
-    print(f"CPU threads: {cpu_threads}")
+    print(f"OpenMP threads: {omp_threads}")
 
 
 class LiveLogger:
@@ -63,16 +58,17 @@ def select_optimal_decoder_layer(
     train_stories,
     modelname,
     candidate_layers,
-    feature_dir=None,
-    trim=5,
+    trim_start=50,
+    trim_end=5,
     ndelays=4,
     use_corr=True,
-    backend="torch_cuda",
-    cpu_threads=1,
+    backend="torch_mps",
+    omp_threads=1,
 ):
-    configure_himalaya_backend(backend=backend, cpu_threads=cpu_threads)
+    configure_himalaya_backend(backend=backend, omp_threads=omp_threads)
 
-    evals_dir = join(DATA_DIR, "derivatives", "results", {modelname}, "layer_evals")
+    results_dir = join(DATA_DIR, "derivatives", "results", modelname)
+    evals_dir = join(results_dir, "layer_evals")
     os.makedirs(evals_dir, exist_ok=True)
     
     if len(candidate_layers) == 1:
@@ -89,7 +85,10 @@ def select_optimal_decoder_layer(
     log(f"Subjects Used:     {subjects}")
     log(f"Training Stories: {train_stories}")
     log(f"Candidate Layers: {candidate_layers}")
-    log(f"Parameters:       trim={trim}, ndelays={ndelays}, use_corr={use_corr}")
+    log(
+        f"Parameters:       trim_start={trim_start}, trim_end={trim_end}, "
+        f"ndelays={ndelays}, use_corr={use_corr}"
+    )
     log(f"Output File:      {log_file_path}")
     log("-" * 80)
 
@@ -106,25 +105,38 @@ def select_optimal_decoder_layer(
         log(f"\nProcessing Subject: {subject}")
         log("-" * 40)
 
-        _, good_stories = get_response(train_stories, subject)
+        _, response_stories = get_response(train_stories, subject)
 
-        if len(good_stories) < 2:
-            log(f"  WARNING: Only {len(good_stories)} valid stories for {subject}, skipping")
+        if len(response_stories) < 2:
+            log(
+                f"  WARNING: Only {len(response_stories)} valid stories for "
+                f"{subject}, skipping"
+            )
             continue
 
-        log(f"  Using {len(good_stories)} valid training stories")
+        log(f"  Using {len(response_stories)} valid training stories")
 
         for layer in candidate_layers:
-            
-            feature_space = get_whisper_decoder_feature_space(
-                good_stories,
+            feature_space, good_stories = get_feature_space(
+                response_stories,
                 modelname=modelname,
                 layer=layer,
-                feature_dir=feature_dir,
+                include_conv=True,
+                include_enc=True,
             )
+            if len(good_stories) < 2:
+                log(
+                    f"  WARNING: Only {len(good_stories)} stories have "
+                    f"features for layer {layer}; skipping"
+                )
+                continue
 
             full_stim_raw = apply_zscore_and_hrf(
-                good_stories, feature_space, trim, ndelays
+                good_stories,
+                feature_space,
+                trim_start,
+                trim_end,
+                ndelays,
             ).astype(np.float32)
             full_stim_raw = np.nan_to_num(full_stim_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -136,7 +148,7 @@ def select_optimal_decoder_layer(
             current_row = 0
             for story in good_stories:
                 story_feat = feature_space[story]
-                n_trs = story_feat.shape[0] - (2 * trim)
+                n_trs = story_feat.shape[0] - trim_start - trim_end
                 story_row_bounds[story] = (current_row, current_row + n_trs)
                 current_row += n_trs
 
@@ -270,11 +282,13 @@ def select_optimal_decoder_layer(
         "selection_threshold": float(threshold),
         "selection_method": "leave-one-story-out with Kernel RidgeCV",
         "use_corr": bool(use_corr),
+        "trim_start": int(trim_start),
+        "trim_end": int(trim_end),
+        "ndelays": int(ndelays),
     }
 
-    save_location = join(REPO_DIR, "results", "whisper")
-    os.makedirs(save_location, exist_ok=True)
-    layer_selection_path = join(save_location, "layer_selection.json")
+    os.makedirs(results_dir, exist_ok=True)
+    layer_selection_path = join(results_dir, "layer_selection.json")
 
     with open(layer_selection_path, "w") as f:
         json.dump(layer_selection, f, indent=2)
@@ -287,22 +301,27 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--subjects", nargs="+", default=["UTS01", "UTS02", "UTS03"])
     parser.add_argument("--sessions", nargs="+", type=int, default=[1, 2, 3, 4, 5])
-    parser.add_argument("--modelname", type=str, default="whisper")
+    parser.add_argument("--modelname", type=str, default="whisper-large")
     parser.add_argument("--layer", type=int, default=None, help="Single layer for SLURM array execution")
     parser.add_argument("--optimal-start", type=int, default=22)
     parser.add_argument("--optimal-stop", type=int, default=32)
-    parser.add_argument("--trim", type=int, default=5)
+    parser.add_argument("--trim_start", type=int, default=50)
+    parser.add_argument("--trim_end", type=int, default=5)
     parser.add_argument("--ndelays", type=int, default=4)
-    parser.add_argument("--feature-dir", type=str, default=None)
-    parser.add_argument("--use-corr", action="store_true")
     parser.add_argument(
-        "--backend",
-        choices=["torch_cuda", "torch_mps", "cupy", "numpy"],
-        default="torch_mps",
-        help="Himalaya backend. Defaults to PyTorch CUDA for GPU runtimes.",
+        "--use-corr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Select layers by correlation (default) or signed variance explained.",
     )
     parser.add_argument(
-        "--cpu-threads",
+        "--backend",
+        choices=["numpy", "cupy", "torch_cuda", "torch_mps"],
+        default="torch_mps",
+        help="Himalaya backend. Defaults to PyTorch MPS.",
+    )
+    parser.add_argument(
+        "--omp-threads",
         type=int,
         default=1,
         help="CPU thread limit for preprocessing and numerical libraries.",
@@ -321,20 +340,39 @@ if __name__ == "__main__":
     if args.max_stories is not None and args.max_stories > 0:
         train_stories = train_stories[: args.max_stories]
 
+    if not train_stories:
+        parser.error("No training stories are available for the selected sessions.")
+
+    n_decoder_states = get_decoder_layer_count(
+        train_stories[0],
+        modelname=args.modelname,
+    )
+    optimal_stop = min(args.optimal_stop, n_decoder_states - 1)
+    if args.optimal_start > optimal_stop:
+        parser.error(
+            f"No valid decoder layers in range {args.optimal_start}.."
+            f"{args.optimal_stop}; found {n_decoder_states} states."
+        )
+
     if args.layer is not None:
+        if not 0 <= args.layer < n_decoder_states:
+            parser.error(
+                f"--layer must be in [0, {n_decoder_states - 1}] for "
+                f"{args.modelname}."
+            )
         candidate_layers = [args.layer]
     else:
-        candidate_layers = list(range(args.optimal_start, args.optimal_stop + 1))
+        candidate_layers = list(range(args.optimal_start, optimal_stop + 1))
 
     select_optimal_decoder_layer(
         subjects=args.subjects,
         train_stories=train_stories,
         modelname=args.modelname,
         candidate_layers=candidate_layers,
-        feature_dir=args.feature_dir,
-        trim=args.trim,
+        trim_start=args.trim_start,
+        trim_end=args.trim_end,
         ndelays=args.ndelays,
         use_corr=args.use_corr,
         backend=args.backend,
-        cpu_threads=args.cpu_threads,
+        omp_threads=args.omp_threads,
     )

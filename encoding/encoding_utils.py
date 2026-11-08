@@ -12,7 +12,7 @@ from ridge_utils.utils import make_delayed
 from config import DATA_DIR, EM_DATA_DIR
 from significance_testing import fdr_correct
 
-def apply_zscore_and_hrf(stories, downsampled_feat, trim, ndelays):
+def apply_zscore_and_hrf(stories, downsampled_feat, trim_start, trim_end, ndelays):
     """Get (z-scored and delayed) stimulus for train and test stories.
     The stimulus matrix is delayed (typically by 2,4,6,8 secs) to estimate the
     hemodynamic response function with a Finite Impulse Response model.
@@ -22,13 +22,14 @@ def apply_zscore_and_hrf(stories, downsampled_feat, trim, ndelays):
 
     Variables:
         downsampled_feat (dict): Downsampled feature vectors for all stories.
-        trim: Trim downsampled stimulus matrix.
-        delays: List of delays for Finite Impulse Response (FIR) model.
+        trim_start: Number of initial time points to trim from the downsampled stimulus matrix.
+        trim_end: Number of final time points to trim from the downsampled stimulus matrix.
+        ndelays: Number of delays for Finite Impulse Response (FIR) model.
 
     Returns:
         delstim: <float32>[TRs, features * ndelays]
     """
-    stim = [zscore(downsampled_feat[s][5+trim:-trim]) for s in stories]
+    stim = [zscore(downsampled_feat[s][trim_start:-trim_end]) for s in stories]
     stim = np.vstack(stim)
     delays = range(1, ndelays+1)
     delstim = make_delayed(stim, delays)

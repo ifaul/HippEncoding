@@ -14,9 +14,10 @@ from sklearn.preprocessing import StandardScaler
 
 from config import EM_DATA_DIR, REPO_DIR
 from encoding_utils import apply_zscore_and_hrf, get_response
-from feature_spaces import _FEATURE_CONFIG, get_feature_space
+from feature_spaces import _FEATURE_CONFIG, get_feature_space as get_classic_feature_space
 from ridge_utils.utils import make_delayed
-from whisper_feature_spaces import get_whisper_feature_space, get_decoder_layer_count
+from whisper_feature_spaces import get_feature_space as get_model_feature_space
+from whisper_feature_spaces import get_decoder_layer_count
 
 
 def configure_himalaya_backend(backend="numpy", n_jobs=-1, omp_threads=None):
@@ -176,11 +177,13 @@ def select_optimal_decoder_layer(
         
         for layer in candidate_layers:
             # Load feature space for this layer
-            feature_space, available_stories = get_whisper_feature_space(
+            feature_space, available_stories = get_model_feature_space(
                 valid_stories,
                 modelname=modelname,
                 layer=layer,
                 feature_dir=feature_dir,
+                include_conv=True,
+                include_enc=True,
             )
             
             # Leave-one-story-out validation for this layer
@@ -429,11 +432,13 @@ def run_encoding(args):
 
         print(f"Using Whisper decoder layer: {selected_layer}")
 
-        downsampled_feat, _ = get_whisper_feature_space(
+        downsampled_feat, _ = get_model_feature_space(
             all_stories,
             modelname=args.modelname,
             layer=selected_layer,
             feature_dir=args.feature_dir,
+            include_conv=True,
+            include_enc=True,
         )
 
     else:
@@ -444,7 +449,7 @@ def run_encoding(args):
                 f"Available features: {available}"
             )
 
-        downsampled_feat = get_feature_space(
+        downsampled_feat = get_classic_feature_space(
             args.feature,
             all_stories,
         )

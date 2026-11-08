@@ -17,10 +17,10 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import KFold
 from threadpoolctl import threadpool_limits
 
-from config import DATA_DIR, REPO_DIR
+from config import DATA_DIR
 from encoding_utils import apply_zscore_and_hrf, get_response, get_story_split
-from feature_spaces import _FEATURE_CONFIG, get_feature_space
-from whisper_feature_spaces import get_whisper_feature_space
+from feature_spaces_classic import _FEATURE_CONFIG, get_feature_space as get_classic_feature_space
+from feature_spaces import get_feature_space as get_model_feature_space
 
 
 def to_numpy(array):
@@ -95,11 +95,13 @@ def run_encoding(args):
         else:
             raise Exception("Need to add layer arg or run layer_selection script before running encoding")
         
-        downsampled_feat, _ = get_whisper_feature_space(
+        downsampled_feat, _ = get_model_feature_space(
             all_stories,
             modelname=args.modelname,
             layer=selected_layer,
             feature_dir=args.feature_dir,
+            include_conv=True,
+            include_enc=True,
         )
         print("Loaded feature spaces for all stories")
 
@@ -108,7 +110,7 @@ def run_encoding(args):
             available = " ".join(_FEATURE_CONFIG.keys())
             raise ValueError(f"Unknown feature '{args.feature}'. Available: {available}")
 
-        downsampled_feat = get_feature_space(args.feature, all_stories)
+        downsampled_feat = get_classic_feature_space(args.feature, all_stories)
 
     feature_stories = set(downsampled_feat)
     valid_train_stories = [
@@ -214,11 +216,11 @@ def run_encoding(args):
     for name, idxs in feature_slices.items():
         print(f"  {name}: {len(idxs)} features")
 
-    #alphas = np.logspace(1, 30, 30, dtype=np.float32)
-    #diagonalize_method = (args.diagonalize_method)
+    alphas = np.logspace(1, 30, 30, dtype=np.float32)
+    diagonalize_method = (args.diagonalize_method)
     n_alphas_batch = getattr(args, "n_alphas_batch", 1)
     n_iter = getattr(args, "n_iter", 30)
-    #print(f"Kernel diagonalization method: {diagonalize_method}")
+    print(f"Kernel diagonalization method: {diagonalize_method}")
 
     # =========================================================================
     # 1. Joint Banded Ridge Model (acoustic + speech + language)
@@ -240,18 +242,18 @@ def run_encoding(args):
         )
         
         joint_params = dict(
-            #alphas=alphas,
+            alphas=alphas,
             progress_bar=True,
-            max_iter=n_iter,
-            tol=1e-3,
-            #diagonalize_method=diagonalize_method,
+            diagonalize_method=args.diagonalize_method,
+            n_iter=n_iter,
+            n_alphas_batch=args.n_alphas_batch,
             n_targets_batch=args.n_targets_batch,
         )
         
         joint_model = make_pipeline(
             StandardScaler(with_mean=True, with_std=False),
             joint_kernelizer,
-            MultipleKernelRidgeCV(kernels="precomputed", solver="hyper_gradient", solver_params=joint_params),
+            MultipleKernelRidgeCV(kernels="precomputed", solver_params=joint_params),
         )
         
         joint_model.fit(delRstim, zRresp_masked)

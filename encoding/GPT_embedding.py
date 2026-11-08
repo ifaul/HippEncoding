@@ -107,7 +107,7 @@ def main(
 
         df.to_pickle(pkl_path)
         with h5py.File(h5_path, "w") as f:
-            f.create_dataset(name="activations_enc", data=text_layer_embeddings)
+            f.create_dataset(name="activations_dec", data=text_layer_embeddings)
 
         print(f"Saved {story}: shape {text_layer_embeddings.shape}")
 

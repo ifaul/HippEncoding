@@ -1,179 +1,367 @@
+"""
+Whisper feature spaces for HuthLab/deep-fMRI-dataset.
+
+The embedding files are expected at:
+
+    <FEATURE_DIR>/<modelname>/narrative-<story>.pkl
+    <FEATURE_DIR>/<modelname>/narrative-<story>.h5
+
+The HDF5 datasets (for Whisper) are:
+
+    activations_conv : word x acoustic_dimension
+    activations_enc  : word x encoder_dimension
+    activations_dec  : word x decoder_layer x decoder_dimension
+
+GPT only includes the decoder activations.
+
+This module returns HuthLab-compatible feature spaces:
+
+    {story: array(n_TRs, n_features)}
+"""
+
 import os
-import sys
+import re
+from collections import defaultdict
+
+import h5py
 import numpy as np
-import json
-from os.path import join, dirname
+import pandas as pd
 
+from config import DATA_DIR
 from ridge_utils.interpdata import lanczosinterp2D
-from ridge_utils.SemanticModel import SemanticModel
-from ridge_utils.dsutils import make_semantic_model, make_word_ds, make_phoneme_ds
-from ridge_utils.stimulus_utils import load_textgrids, load_simulated_trfiles
-
-from config import REPO_DIR, EM_DATA_DIR, DATA_DIR
 
 
-def get_story_wordseqs(stories):
-    grids = load_textgrids(stories, DATA_DIR)
-    with open(join(DATA_DIR, "derivatives/respdict.json"), "r") as f:
-        respdict = json.load(f)
-    trfiles = load_simulated_trfiles(respdict)
-    wordseqs = make_word_ds(grids, trfiles)
-    return wordseqs
+FEATURE_DIR = os.environ.get(
+    "FEATURE_DIR",
+    os.path.join(DATA_DIR, "derivatives", "features"),
+)
 
-def get_story_phonseqs(stories):
-    grids = load_textgrids(stories, DATA_DIR)
-    with open(join(DATA_DIR, "derivatives/respdict.json"), "r") as f:
-        respdict = json.load(f)
-    trfiles = load_simulated_trfiles(respdict)
-    wordseqs = make_phoneme_ds(grids, trfiles)
-    return wordseqs
+def normalize_word(word):
+    """Normalize transcript tokens for conservative word matching."""
+    if word is None:
+        return ""
 
-def downsample_word_vectors(stories, word_vectors, wordseqs):
-    """Get Lanczos downsampled word_vectors for specified stories.
+    word = str(word).lower().strip()
+    word = word.replace("’", "'")
+    word = word.replace("–", "-")
+    word = word.replace("—", "-")
 
-    Args:
-        stories: List of stories to obtain vectors for.
-        word_vectors: Dictionary of {story: <float32>[num_story_words, vector_size]}
+    # Retain apostrophes and hyphens because contractions may be meaningful.
+    return re.sub(r"[^a-z0-9'-]", "", word)
 
-    Returns:
-        Dictionary of {story: downsampled vectors}
+
+def path_format(story, modelname, context_len=None):
+    if "whisper" in modelname:
+        root = os.path.join(FEATURE_DIR, modelname)
+    elif "gpt" in modelname:
+        root = os.path.join(FEATURE_DIR, modelname, f"W_{context_len}")
+
+    try:
+        pkl_path = os.path.join(root, f"{story}.pkl")
+        h5_path = os.path.join(root, f"{story}.h5")
+    except Exception as e:
+        raise ValueError(f"Failed to format paths for story {story} in root {root}: {e}")
+
+    return pkl_path, h5_path
+
+
+def load_words(story, modelname, context_len=None):
+    pkl_path, _ = path_format(story, modelname, context_len=context_len)
+
+    if not os.path.exists(pkl_path):
+        raise FileNotFoundError(pkl_path)
+
+    df = pd.read_pickle(pkl_path).copy()
+
+    required = {"word", "start", "end"}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(
+            f"{pkl_path} is missing required columns: {sorted(missing)}"
+        )
+
+    df["word"] = df["word"].fillna("").astype(str)
+    df["start"] = pd.to_numeric(df["start"], errors="coerce")
+    df["end"] = pd.to_numeric(df["end"], errors="coerce")
+
+    df = df.dropna(subset=["start", "end"]).reset_index(drop=True)
+    df["_normalized_word"] = df["word"].map(normalize_word)
+
+    return df
+
+
+def load_activations(
+    story,
+    activation,
+    modelname,
+    layer=None,
+    context_len=None,
+):
     """
-    downsampled_semanticseqs = dict()
+    Load word-level activations.
+
+    activation must be one of:
+        conv, enc, dec
+    """
+    _, h5_path = path_format(story, modelname, context_len=context_len)
+
+    if not os.path.exists(h5_path):
+        raise FileNotFoundError(h5_path)
+
+    dataset_name = {
+        "conv": "activations_conv",
+        "enc": "activations_enc",
+        "dec": "activations_dec",
+    }[activation]
+
+    with h5py.File(h5_path, "r") as h5:
+        if dataset_name not in h5:
+            raise KeyError(f"{dataset_name} not found in {h5_path}")
+
+        states = np.asarray(h5[dataset_name][...], dtype=np.float32)
+
+    if activation == "dec":
+        if states.ndim != 3:
+            raise ValueError(
+                "Expected decoder activations with shape "
+                "(words, layers, dimensions); got "
+                f"{states.shape}"
+            )
+
+        if layer is None:
+            raise ValueError("A decoder layer is required for decoder features.")
+
+        if not 0 <= layer < states.shape[1]:
+            raise ValueError(
+                f"Decoder layer {layer} is outside [0, {states.shape[1] - 1}]"
+            )
+
+        states = states[:, layer, :]
+
+    if states.ndim != 2:
+        raise ValueError(
+            f"Expected word-level activations with two dimensions; got {states.shape}"
+        )
+
+    return states
+
+
+def nearest_word_index(df, target_word, target_time):
+    """Find a matching word, falling back to temporal proximity."""
+    target_word = normalize_word(target_word)
+
+    matching = df[df["_normalized_word"] == target_word]
+    if len(matching):
+        distances = (matching["start"] - target_time).abs()
+        return int(distances.idxmin())
+
+    distances = (df["start"] - target_time).abs()
+    return int(distances.idxmin())
+
+
+def align_to_huth_words(df, states, huth_words, huth_times):
+    """
+    Align vectors to HuthLab's word sequence.
+
+    Exact normalized word matches are preferred. Repeated words are resolved
+    using timing. Unmatched words use nearest temporal matching.
+    """
+    if len(df) != states.shape[0]:
+        raise ValueError(
+            "Whisper transcript and activation lengths differ: "
+            f"{len(df)} words versus {states.shape[0]} activation rows."
+        )
+
+    aligned = np.zeros(
+        (len(huth_words), states.shape[1]),
+        dtype=np.float32,
+    )
+
+    candidates = defaultdict(list)
+    for index, word in enumerate(df["_normalized_word"]):
+        if word:
+            candidates[word].append(index)
+
+    used = set()
+
+    for row, (word, time) in enumerate(zip(huth_words, huth_times)):
+        normalized = normalize_word(word)
+        possible = candidates.get(normalized, [])
+
+        if possible:
+            available = [index for index in possible if index not in used]
+            if not available:
+                available = possible
+
+            index = min(
+                available,
+                key=lambda i: abs(float(df.iloc[i]["start"]) - float(time)),
+            )
+        else:
+            index = nearest_word_index(df, word, time)
+
+        aligned[row] = states[index]
+        used.add(index)
+
+    return aligned
+
+
+def get_story_feature(
+    story,
+    activation,
+    modelname,
+    layer=None,
+    context_len=None,
+):
+    """
+    Return one TR-aligned feature matrix for one story.
+    """
+    from feature_spaces import get_story_wordseqs
+    
+    wordseqs = get_story_wordseqs([story])
+    wordseq = wordseqs[story]
+
+    huth_words = np.asarray(wordseq.data, dtype=object)
+    huth_word_times = np.asarray(wordseq.data_times, dtype=np.float32)
+    huth_tr_times = np.asarray(wordseq.tr_times, dtype=np.float32)
+
+    words = load_words(
+        story,
+        modelname=modelname,
+        context_len=context_len,
+    )
+    states = load_activations(
+        story,
+        activation=activation,
+        modelname=modelname,
+        layer=layer,
+        context_len=context_len,
+    )
+
+    word_features = align_to_huth_words(
+        words,
+        states,
+        huth_words,
+        huth_word_times,
+    )
+
+    tr_features = lanczosinterp2D(
+        word_features,
+        huth_word_times,
+        huth_tr_times,
+        window=3,
+    )
+
+    return np.asarray(tr_features, dtype=np.float32)
+
+
+def get_feature_space(
+    stories,
+    modelname,
+    context_len=None,
+    layer=None,
+    include_conv=True,
+    include_enc=True,
+):
+    """
+    Return the concatenated acoustic + encoder + decoder feature space.
+
+    Decoder features use exactly one selected decoder layer.
+    
+    Skips any stories with missing Whisper files.
+    Returns a tuple (feature_dict, valid_stories).
+    """
+    output = {}
+    valid_stories = []
+
     for story in stories:
-        downsampled_semanticseqs[story] = lanczosinterp2D(
-            word_vectors[story], wordseqs[story].data_times, 
-            wordseqs[story].tr_times, window=3)
-    return downsampled_semanticseqs
-
-###########################################
-########## ARTICULATORY Features ##########
-###########################################
-
-def ph_to_articulate(ds, ph_2_art):
-    """ Following make_phoneme_ds converts the phoneme DataSequence object to an 
-    articulate Datasequence for each grid.
-    """
-    articulate_ds = []
-    for ph in ds:
         try:
-            articulate_ds.append(ph_2_art[ph])
-        except:
-            articulate_ds.append([""])
-    return articulate_ds
+            pkl_path, h5_path = path_format(
+                story,
+                modelname,
+                context_len=context_len,
+            )
+            
+            if not os.path.exists(pkl_path):
+                raise FileNotFoundError(
+                    f"Whisper pickle not found: {pkl_path}"
+                )
+            
+            if not os.path.exists(h5_path):
+                raise FileNotFoundError(
+                    f"Whisper HDF5 not found: {h5_path}"
+                )
+            
+            blocks = []
 
-articulates = ["bilabial","postalveolar","alveolar","dental","labiodental",
-               "velar","glottal","palatal", "plosive","affricative","fricative",
-               "nasal","lateral","approximant","voiced","unvoiced","low", "mid",
-               "high","front","central","back"]
+            if include_conv:
+                blocks.append(
+                    get_story_feature(
+                        story,
+                        activation="conv",
+                        modelname=modelname,
+                        context_len=context_len,
+                    )
+                )
 
-def histogram_articulates(ds, data, articulateset=articulates):
-    """Histograms the articulates in the DataSequence [ds]."""
-    final_data = []
-    for art in ds:
-        final_data.append(np.isin(articulateset, art))
-    final_data = np.array(final_data)
-    return (final_data, data.split_inds, data.data_times, data.tr_times)
+            if include_enc:
+                blocks.append(
+                    get_story_feature(
+                        story,
+                        activation="enc",
+                        modelname=modelname,
+                        context_len=context_len,
+                    )
+                )
 
-def get_articulation_vectors(allstories):
-    """Get downsampled articulation vectors for specified stories.
-    Args:
-        allstories: List of stories to obtain vectors for.
-    Returns:
-        Dictionary of {story: downsampled vectors}
-    """
-    with open(join(EM_DATA_DIR, "articulationdict.json"), "r") as f:
-        artdict = json.load(f)
-    phonseqs = get_story_phonseqs(allstories) #(phonemes, phoneme_times, tr_times)
-    downsampled_arthistseqs = {}
-    for story in allstories:
-        olddata = np.array(
-            [ph.upper().strip("0123456789") for ph in phonseqs[story].data])
-        ph_2_art = ph_to_articulate(olddata, artdict)
-        arthistseq = histogram_articulates(ph_2_art, phonseqs[story])
-        downsampled_arthistseqs[story] = lanczosinterp2D(
-            arthistseq[0], arthistseq[2], arthistseq[3])
-    return downsampled_arthistseqs
+            blocks.append(
+                get_story_feature(
+                    story,
+                    activation="dec",
+                    modelname=modelname,
+                    layer=layer,
+                    context_len=context_len,
+                )
+            )
 
+            n_trs = {block.shape[0] for block in blocks}
+            if len(n_trs) != 1:
+                raise ValueError(
+                    f"Feature blocks for {story} have incompatible TR counts: "
+                    f"{sorted(n_trs)}"
+                )
 
-###########################################
-########## PHONEME RATE Features ##########
-###########################################
+            output[story] = np.hstack(blocks).astype(np.float32)
+            valid_stories.append(story)
+            
+        except (FileNotFoundError, OSError, KeyError) as e:
+            print(
+                f"WARNING: Whisper features unavailable for '{story}': "
+                f"{type(e).__name__}"
+            )
+            print(f"  Details: {e}")
+            print(f"  Skipping story '{story}'")
+            continue
 
-def get_phonemerate_vectors(allstories):
-    """Get downsampled phonemerate vectors for specified stories.
-    Args:
-        allstories: List of stories to obtain vectors for.
-    Returns:
-        Dictionary of {story: downsampled vectors}
-    """
-    with open(join(EM_DATA_DIR, "articulationdict.json"), "r") as f:
-        artdict = json.load(f)
-    phonseqs = get_story_phonseqs(allstories) #(phonemes, phoneme_times, tr_times)
-    downsampled_arthistseqs = {}
-    for story in allstories:
-        olddata = np.array(
-            [ph.upper().strip("0123456789") for ph in phonseqs[story].data])
-        ph_2_art = ph_to_articulate(olddata, artdict)
-        arthistseq = histogram_articulates(ph_2_art, phonseqs[story])
-        nphonemes = arthistseq[0].shape[0]
-        phonemerate = np.ones([nphonemes, 1])
-        downsampled_arthistseqs[story] = lanczosinterp2D(
-            phonemerate, arthistseq[2], arthistseq[3])
-    return downsampled_arthistseqs
+    if not output:
+        raise ValueError(
+            f"No valid Whisper features found for any of {stories}"
+        )
 
-########################################
-########## WORD RATE Features ##########
-########################################
+    return output, valid_stories
 
-def get_wordrate_vectors(allstories):
-    """Get wordrate vectors for specified stories.
+def get_decoder_layer_count(
+    story,
+    modelname,
+    context_len=None,
+):
+    """Return the number of decoder states saved in one HDF5 file."""
+    _, h5_path = path_format(story, modelname, context_len=context_len)
 
-    Args:
-        allstories: List of stories to obtain vectors for.
+    with h5py.File(h5_path, "r") as h5:
+        states = h5["activations_dec"]
 
-    Returns:
-        Dictionary of {story: downsampled vectors}
-    """
-    eng1000 = SemanticModel.load(join(EM_DATA_DIR, "english1000sm.hf5"))
-    wordseqs = get_story_wordseqs(allstories)
-    vectors = {}
-    for story in allstories:
-        nwords = len(wordseqs[story].data)
-        vectors[story] = np.ones([nwords, 1])
-    return downsample_word_vectors(allstories, vectors, wordseqs)
+        if states.ndim != 3:
+            raise ValueError(f"Unexpected decoder shape: {states.shape}")
 
-
-######################################
-########## ENG1000 Features ##########
-######################################
-
-def get_eng1000_vectors(allstories):
-    """Get Eng1000 vectors (985-d) for specified stories.
-
-    Args:
-        allstories: List of stories to obtain vectors for.
-
-    Returns:
-        Dictionary of {story: downsampled vectors}
-    """
-    eng1000 = SemanticModel.load(join(EM_DATA_DIR, "english1000sm.hf5"))
-    wordseqs = get_story_wordseqs(allstories)
-    vectors = {}
-    for story in allstories:
-        sm = make_semantic_model(wordseqs[story], [eng1000], [985])
-        vectors[story] = sm.data
-    return downsample_word_vectors(allstories, vectors, wordseqs)
-
-############################################
-########## Feature Space Creation ##########
-############################################
-
-_FEATURE_CONFIG = {
-    "articulation": get_articulation_vectors,
-    "phonemerate": get_phonemerate_vectors,
-    "wordrate": get_wordrate_vectors,
-    "eng1000": get_eng1000_vectors,
-}
-
-def get_feature_space(feature, *args):
-    return _FEATURE_CONFIG[feature](*args)
+        return states.shape[1]
